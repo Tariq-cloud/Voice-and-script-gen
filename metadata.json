@@ -1,0 +1,8 @@
+{
+  "name": "Gemini Multimodal Studio",
+  "description": "A high-performance creative suite featuring text-to-speech, prompt-based video generation with Veo, high-res image creation, and advanced media understanding using Gemini 3.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
