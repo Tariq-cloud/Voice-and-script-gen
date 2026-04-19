@@ -10,6 +10,7 @@ const VideoGenView: React.FC = () => {
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [status, setStatus] = useState('');
   const [errorState, setErrorState] = useState<'none' | 'quota' | 'permission'>('none');
+  const [provider, setProvider] = useState<'gemini' | 'public'>('gemini');
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -34,6 +35,19 @@ const VideoGenView: React.FC = () => {
     if (!prompt && !startImage) return;
     setLoading(true);
     setErrorState('none');
+    
+    if (provider === 'public') {
+      setStatus('Synthesizing Frame Sequence (Free)...');
+      setTimeout(() => {
+        const seed = Math.floor(Math.random() * 1000000);
+        const url = `https://pollinations.ai/p/${encodeURIComponent(prompt || 'Cinematic scene')}?width=1280&height=720&seed=${seed}&nologo=true`;
+        setVideoUrl(url); // We use image as video in public mode
+        setLoading(false);
+        setStatus('Public Frame Synced.');
+      }, 1500);
+      return;
+    }
+
     setStatus('Contacting Veo servers...');
     try {
       const url = await generateVideo(prompt, aspectRatio, startImage || undefined);
@@ -93,6 +107,20 @@ const VideoGenView: React.FC = () => {
               >
                 Dismiss Error
               </button>
+              
+              <div className="pt-4 border-t border-white/5 space-y-3">
+                <p className="text-[10px] text-gray-500 uppercase font-bold">Alternative</p>
+                <button 
+                  onClick={() => {
+                    setProvider('public');
+                    setErrorState('none');
+                    handleGenerate();
+                  }}
+                  className="w-full py-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-xs font-bold text-emerald-400 hover:bg-emerald-500/20 transition-all"
+                >
+                  Use Public Core (No API Key Required)
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -100,9 +128,30 @@ const VideoGenView: React.FC = () => {
 
       <div className="lg:col-span-4 space-y-6">
         <div className="space-y-4">
+          <label className="text-sm font-bold text-gray-400 uppercase tracking-widest">Engine Selection</label>
+          <div className="flex bg-black/40 p-1 rounded-2xl border border-white/10">
+            <button
+              onClick={() => setProvider('gemini')}
+              className={`flex-1 py-3 rounded-xl text-xs font-bold transition-all ${provider === 'gemini' ? 'bg-indigo-500 text-white shadow-lg shadow-indigo-500/30' : 'text-gray-500 hover:text-gray-300'}`}
+            >
+              Neural Core (Veo)
+            </button>
+            <button
+              onClick={() => setProvider('public')}
+              className={`flex-1 py-3 rounded-xl text-xs font-bold transition-all ${provider === 'public' ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-500/30' : 'text-gray-500 hover:text-gray-300'}`}
+            >
+              Public Core (Free)
+            </button>
+          </div>
+          <p className="text-[10px] text-gray-600 font-bold px-2">
+            {provider === 'gemini' ? 'Professional cinematic video. Requires GEMINI_API_KEY.' : 'Conceptual frames for rapid prototyping. No API limits.'}
+          </p>
+        </div>
+
+        <div className="space-y-4">
           <label className="text-sm font-bold text-gray-400 uppercase tracking-widest">Creative Prompt</label>
           <textarea
-            value={prompt}
+            value={prompt || ''}
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="Describe your cinematic vision..."
             className="w-full h-32 p-4 glass-panel rounded-xl border-white/10 focus:border-indigo-500/50 outline-none resize-none"
@@ -154,15 +203,28 @@ const VideoGenView: React.FC = () => {
         <div className="aspect-video w-full glass-panel rounded-3xl border-white/5 overflow-hidden relative flex items-center justify-center group shadow-2xl">
           {videoUrl ? (
             <>
-              <video src={videoUrl} controls autoPlay loop className="w-full h-full object-contain" />
+              {provider === 'public' ? (
+                <div className="relative w-full h-full overflow-hidden">
+                  <img 
+                    src={videoUrl} 
+                    className="w-full h-full object-cover animate-pulse" 
+                    alt="Public Frame" 
+                    style={{ animationDuration: '8s' }}
+                  />
+                  <div className="absolute inset-0 bg-indigo-500/10 pointer-events-none"></div>
+                  <div className="absolute top-2 left-2 px-2 py-1 bg-black/60 rounded text-[8px] font-bold text-emerald-400 uppercase tracking-widest border border-emerald-500/20">Public Core Engine</div>
+                </div>
+              ) : (
+                <video src={videoUrl} controls autoPlay loop className="w-full h-full object-contain" />
+              )}
               <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
                 <a 
                   href={videoUrl} 
-                  download="veo-video.mp4" 
+                  download={provider === 'public' ? 'gen-frame.png' : 'veo-video.mp4'} 
                   className="p-3 bg-black/60 backdrop-blur-md rounded-xl border border-white/10 hover:bg-black/80 flex items-center gap-2 font-bold text-sm"
                 >
                   <svg className="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                  Download Video
+                  Download {provider === 'public' ? 'Frame' : 'Video'}
                 </a>
               </div>
             </>

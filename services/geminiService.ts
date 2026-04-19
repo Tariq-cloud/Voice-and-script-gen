@@ -2,8 +2,20 @@
 import { GoogleGenAI, Modality, Type, GenerateContentResponse } from "@google/genai";
 import { VoiceSettings } from "../types";
 
-// Always initialize with the direct environment key as per guidelines
-const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+// Priority selection for API keys: 
+// 1. process.env.API_KEY (Selected from dialog)
+// 2. process.env.GEMINI_API_KEY (System default)
+const getApiKey = () => {
+  return process.env.API_KEY || process.env.GEMINI_API_KEY || '';
+};
+
+const getAI = () => {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    console.warn("No Gemini API key found in environment.");
+  }
+  return new GoogleGenAI({ apiKey });
+};
 
 export class QuotaError extends Error {
   constructor(message: string) {
@@ -23,14 +35,15 @@ const handleApiError = (error: any) => {
   console.error("Gemini API Error Context:", error);
   const errorMessage = error?.message || String(error);
   
-  if (errorMessage.includes("429") || errorMessage.toLowerCase().includes("quota exceeded") || errorMessage.toLowerCase().includes("too many requests")) {
-    throw new QuotaError("API Quota Exceeded. Please rotate to a paid project key.");
-  }
-  
-  if (errorMessage.includes("403") || errorMessage.toLowerCase().includes("permission denied")) {
-    throw new PermissionError("Permission Denied. Ensure the API key belongs to a paid project with billing enabled.");
+  // 403 usually means the key doesn't have the API enabled or the model is restricted
+  if (errorMessage.includes("403") || errorMessage.toLowerCase().includes("permission denied") || errorMessage.toLowerCase().includes("permission_denied")) {
+    throw new PermissionError("PERMISSION_DENIED: The caller does not have permission. Please ensure you have selected a valid API key from a project with the Generative AI API enabled and billing attached.");
   }
 
+  if (errorMessage.includes("429") || errorMessage.toLowerCase().includes("quota exceeded") || errorMessage.toLowerCase().includes("too many requests")) {
+    throw new QuotaError("API Quota Exceeded. Please switch to a different API key or wait for the limit to reset.");
+  }
+  
   if (errorMessage.includes("500") || errorMessage.includes("Internal error")) {
     throw new Error("SERVER_ERROR: The neural engine encountered an internal error. This often happens with very long text or complex styling in the preview model. Try shortening the text.");
   }
@@ -59,7 +72,7 @@ export const enhanceTextForSpeech = async (text: string) => {
   try {
     const ai = getAI();
     const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
+      model: 'gemini-3.1-pro-preview',
       contents: `Rewrite this script for natural TTS flow. Use '...' for brief pauses. Keep the original language. Output ONLY the new script: "${text}"`,
     });
     return sanitizeForTTS(response.text || text);
@@ -79,14 +92,25 @@ export const generateTTS = async (text: string, voiceName: string, settings?: Vo
   // The 500 error is often triggered by complex prompt instructions combined with voiceConfig.
   // We use the most stable format: "Say [style/emotion]: [text]"
   const style = settings?.style || 'expressive';
-  const prompt = customVocalPrompt 
-    ? `Speak this ${style}, ${customVocalPrompt}: ${sanitizedText}`
-    : `Speak this ${style}: ${sanitizedText}`;
+  const accent = settings?.accent && settings.accent !== 'natural' ? `${settings.accent} accent` : '';
+  
+  // Transform numerical pitch/rate into verbal descriptions for the prompt instruction
+  const pitchDesc = settings?.pitch ? (settings.pitch > 1.1 ? 'with a high pitch' : settings.pitch < 0.9 ? 'with a low pitch' : '') : '';
+  const rateDesc = settings?.rate ? (settings.rate > 1.2 ? 'speaking quickly' : settings.rate < 0.8 ? 'speaking slowly' : '') : '';
+  
+  let instructions: string[] = [style];
+  if (accent) instructions.push(accent);
+  if (pitchDesc) instructions.push(pitchDesc);
+  if (rateDesc) instructions.push(rateDesc);
+  if (customVocalPrompt) instructions.push(customVocalPrompt);
+
+  const prefix = instructions.filter(Boolean).join(', ');
+  const prompt = `Speak this ${prefix}: ${sanitizedText}`;
 
   try {
     const ai = getAI();
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
+      model: "gemini-3.1-flash-tts-preview",
       contents: [{ parts: [{ text: prompt }] }],
       config: {
         // Removing systemInstruction as it can cause 500s in the current preview build
@@ -111,11 +135,11 @@ export const classifyVoice = async (base64Audio: string, mimeType: string) => {
   try {
     const ai = getAI();
     const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
+      model: 'gemini-3.1-pro-preview',
       contents: {
         parts: [
           { inlineData: { data: base64Audio.split(',')[1], mimeType } },
-          { text: "Analyze this voice for cloning. Match to: Puck, Charon, Zephyr, Fenrir, Kore, Aoide. Return JSON: {id, gender, traits:[], summary}" }
+          { text: "Analyze this voice for cloning. Identify the speaker's core personality. Estimate their average pitch (low, medium, high), speech rate (slow, normal, fast), and general style (e.g., calm, energetic, clinical). Match to one of: Puck, Charon, Zephyr, Fenrir, Kore, Aoide. Return JSON: {id, gender, pitch, rate, style, traits:[], summary}" }
         ]
       },
       config: { responseMimeType: "application/json" }
@@ -124,11 +148,22 @@ export const classifyVoice = async (base64Audio: string, mimeType: string) => {
     return { 
       id: result.id || 'Zephyr', 
       gender: result.gender || 'male', 
+      pitch: result.pitch || 'medium',
+      rate: result.rate || 'normal',
+      style: result.style || 'expressive',
       traits: result.traits || ["Standard"], 
       summary: result.summary || "Neural identity mapped."
     };
   } catch (e) { 
-    return { id: 'Zephyr', gender: 'male', traits: ["Standard"], summary: "Default profile assigned." };
+    return { 
+      id: 'Zephyr', 
+      gender: 'male', 
+      pitch: 'medium', 
+      rate: 'normal', 
+      style: 'expressive', 
+      traits: ["Standard"], 
+      summary: "Default profile assigned." 
+    };
   }
 };
 
@@ -136,7 +171,7 @@ export const generateVideo = async (prompt: string, aspectRatio: '16:9' | '9:16'
   try {
     const ai = getAI();
     const payload: any = {
-      model: 'veo-3.1-fast-generate-preview',
+      model: 'veo-3.1-lite-generate-preview',
       prompt: prompt || 'A cinematic scene',
       config: { numberOfVideos: 1, resolution: '720p', aspectRatio }
     };
@@ -147,18 +182,31 @@ export const generateVideo = async (prompt: string, aspectRatio: '16:9' | '9:16'
       operation = await ai.operations.getVideosOperation({ operation: operation });
     }
     const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
-    const response = await fetch(`${downloadLink}&key=${process.env.API_KEY}`);
+    if (!downloadLink) throw new Error("Video generation completed but no URI returned.");
+
+    const response = await fetch(downloadLink, {
+      method: 'GET',
+      headers: {
+        'x-goog-api-key': getApiKey(),
+      },
+    });
     const blob = await response.blob();
     return URL.createObjectURL(blob);
   } catch (e) { return handleApiError(e); }
 };
 
-export const generateImage = async (prompt: string, size: '1K' | '2K' | '4K', useNanoPro: boolean = false) => {
+export const generateImage = async (prompt: string, size: '1K' | '2K' | '4K', useNanoPro: boolean = false, provider: 'gemini' | 'pollinations' = 'gemini') => {
+  if (provider === 'pollinations') {
+    const width = size === '1K' ? 1024 : 2048;
+    const height = size === '1K' ? 1024 : 2048;
+    return `https://pollinations.ai/p/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${Math.floor(Math.random() * 1000000)}&nologo=true`;
+  }
+
   try {
     const ai = getAI();
-    const model = (useNanoPro || size !== '1K') ? 'gemini-3-pro-image-preview' : 'gemini-2.5-flash-image';
+    const model = (useNanoPro || size !== '1K') ? 'gemini-3.1-flash-image-preview' : 'gemini-2.5-flash-image';
     const imageConfig: any = { aspectRatio: "1:1" };
-    if (model === 'gemini-3-pro-image-preview') imageConfig.imageSize = size;
+    if (model === 'gemini-3.1-flash-image-preview') imageConfig.imageSize = size;
     const response = await ai.models.generateContent({
       model,
       contents: { parts: [{ text: prompt }] },
@@ -175,7 +223,7 @@ export const analyzeMedia = async (fileBase64: string, mimeType: string) => {
   try {
     const ai = getAI();
     const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
+      model: 'gemini-3.1-pro-preview',
       contents: {
         parts: [
           { inlineData: { data: fileBase64.split(',')[1], mimeType } },
@@ -223,7 +271,7 @@ export const analyzeUrl = async (url: string) => {
     4. Breakdown the content into segments (Hook, Intro, Main Content, Outro).`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
+      model: 'gemini-3.1-pro-preview',
       contents: prompt,
       config: {
         tools: [{googleSearch: {}}],

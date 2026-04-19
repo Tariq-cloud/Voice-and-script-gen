@@ -2,10 +2,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
 
-interface ResponseHistory {
+interface ChatMessage {
   id: string;
-  transcript: string;
-  audioUrl: string | null;
+  role: 'user' | 'model';
+  text: string;
+  audioUrl?: string | null;
   timestamp: Date;
 }
 
@@ -96,14 +97,41 @@ const AudioPlayer: React.FC<{ url: string; id: string }> = ({ url, id }) => {
 
 const LiveView: React.FC = () => {
   const [active, setActive] = useState(false);
-  const [responses, setResponses] = useState<ResponseHistory[]>([]);
+  const [connStatus, setConnStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [responses, setResponses] = useState<ChatMessage[]>([]);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const [currentTurnAudioChunks, setCurrentTurnAudioChunks] = useState<Uint8Array[]>([]);
-  const [currentOutputTranscription, setCurrentOutputTranscription] = useState('');
-  
+  const [currentOutputText, setCurrentOutputText] = useState('');
+  const [currentInputText, setCurrentInputText] = useState('');
+
+  const handleSwitchKey = async () => {
+    // @ts-ignore
+    if (window.aistudio && typeof window.aistudio.openSelectKey === 'function') {
+      // @ts-ignore
+      await window.aistudio.openSelectKey();
+      setErrorMsg(null);
+      setConnStatus('idle');
+    }
+  };
+
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [responses, currentInputText, currentOutputText]);
+
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionRef = useRef<any>(null);
+
+  // Buffer REFS to avoid stale closures in onmessage
+  const currentOutputTextRef = useRef('');
+  const currentInputTextRef = useRef('');
+  const currentTurnAudioChunksRef = useRef<Uint8Array[]>([]);
+  const responsesRef = useRef<ChatMessage[]>([]);
 
   const decode = (base64: string) => {
     const binaryString = atob(base64);
@@ -173,28 +201,54 @@ const LiveView: React.FC = () => {
       sessionRef.current = null;
     }
     setActive(false);
+    setErrorMsg(null);
   };
 
-  const finalizeTurn = (transcript: string, chunks: Uint8Array[]) => {
-    if (!transcript && chunks.length === 0) return;
+  const finalizeTurn = (transcript: string, chunks: Uint8Array[], role: 'user' | 'model' = 'model') => {
+    if (!transcript.trim() && chunks.length === 0) return;
     let audioUrl = null;
     if (chunks.length > 0) {
       const wav = encodeWAV(chunks, 24000);
       audioUrl = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
     }
-    const newResponse: ResponseHistory = {
-      id: Math.random().toString(36).substr(2, 9),
-      transcript: transcript || '(Neural audio output)',
-      audioUrl,
-      timestamp: new Date()
-    };
-    setResponses(prev => [newResponse, ...prev]);
-    setCurrentTurnAudioChunks([]);
-    setCurrentOutputTranscription('');
+
+    const streamingId = role === 'user' ? 'streaming-user' : 'streaming-model';
+    const permanentId = Math.random().toString(36).substr(2, 9);
+
+    setResponses(prev => {
+      const updated = [...prev];
+      const index = updated.findIndex(m => m.id === streamingId);
+      
+      const newMessage: ChatMessage = {
+        id: permanentId,
+        role,
+        text: transcript.trim() || (role === 'model' ? '(Neural audio output)' : '(User audio input)'),
+        audioUrl,
+        timestamp: new Date()
+      };
+
+      if (index !== -1) {
+        updated[index] = newMessage;
+      } else {
+        updated.push(newMessage);
+      }
+      responsesRef.current = updated;
+      return updated;
+    });
+
+    if (role === 'model') {
+      setCurrentTurnAudioChunks([]);
+      currentTurnAudioChunksRef.current = [];
+      setCurrentOutputText('');
+      currentOutputTextRef.current = '';
+    } else {
+      setCurrentInputText('');
+      currentInputTextRef.current = '';
+    }
   };
 
   const exportTranscript = () => {
-    const content = responses.map(r => `[${r.timestamp.toLocaleTimeString()}] Gemini: ${r.transcript}`).reverse().join('\n\n');
+    const content = responses.map(r => `[${r.timestamp.toLocaleTimeString()}] ${r.role === 'user' ? 'User' : 'Gemini'}: ${r.text}`).join('\n\n');
     const blob = new Blob([content], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -204,63 +258,168 @@ const LiveView: React.FC = () => {
   };
 
   const startConversation = async () => {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-    audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-    const outputNode = audioContextRef.current.createGain();
-    outputNode.connect(audioContextRef.current.destination);
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    
-    const sessionPromise = ai.live.connect({
-      model: 'gemini-2.5-flash-native-audio-preview-12-2025',
-      callbacks: {
-        onopen: () => {
-          setActive(true);
-          const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-          const source = inputCtx.createMediaStreamSource(stream);
-          const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
-          scriptProcessor.onaudioprocess = (e) => {
-            const inputData = e.inputBuffer.getChannelData(0);
-            const int16 = new Int16Array(inputData.length);
-            for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
-            sessionPromise.then(s => s.sendRealtimeInput({ media: { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' } }));
-          };
-          source.connect(scriptProcessor);
-          scriptProcessor.connect(inputCtx.destination);
-        },
-        onmessage: async (m) => {
-          if (m.serverContent?.outputTranscription) setCurrentOutputTranscription(p => p + m.serverContent?.outputTranscription?.text);
-          const audioData = m.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-          if (audioData && audioContextRef.current) {
-            const bytes = decode(audioData);
-            setCurrentTurnAudioChunks(p => [...p, bytes]);
-            const buffer = await decodeAudioData(bytes, audioContextRef.current, 24000, 1);
-            const source = audioContextRef.current.createBufferSource();
-            source.buffer = buffer;
-            source.connect(outputNode);
-            nextStartTimeRef.current = Math.max(nextStartTimeRef.current, audioContextRef.current.currentTime);
-            source.start(nextStartTimeRef.current);
-            nextStartTimeRef.current += buffer.duration;
-            sourcesRef.current.add(source);
-            source.onended = () => sourcesRef.current.delete(source);
-          }
-          if (m.serverContent?.interrupted) {
-            sourcesRef.current.forEach(s => s.stop());
-            sourcesRef.current.clear();
-            nextStartTimeRef.current = 0;
-          }
-        },
-        onerror: () => setActive(false),
-        onclose: () => setActive(false),
-      },
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
-        outputAudioTranscription: {},
-        inputAudioTranscription: {},
-        systemInstruction: "You are a highly capable AI assistant in a low-latency voice environment."
+    setErrorMsg(null);
+    setConnStatus('connecting');
+    try {
+      // Priority: process.env.API_KEY (selected) > process.env.GEMINI_API_KEY (default)
+      const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY || '';
+      const ai = new GoogleGenAI({ apiKey });
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      const outputNode = audioContextRef.current.createGain();
+      outputNode.connect(audioContextRef.current.destination);
+      
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err: any) {
+        console.error("Media Device Permission Error:", err);
+        setConnStatus('error');
+        if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+          setErrorMsg("Microphone hardware was not found. Please connect a recording device.");
+        } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+          setErrorMsg("Microphone access was denied. Please allow permissions in your browser settings.");
+        } else {
+          setErrorMsg("Could not access microphone. Please check your connection.");
+        }
+        return;
       }
-    });
-    sessionRef.current = await sessionPromise;
+      
+      const sessionPromise = ai.live.connect({
+        model: 'gemini-3.1-flash-live-preview',
+        callbacks: {
+          onopen: () => {
+            setActive(true);
+            setConnStatus('connected');
+            const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+            const source = inputCtx.createMediaStreamSource(stream);
+            const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
+            scriptProcessor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              const int16 = new Int16Array(inputData.length);
+              for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
+              const encodedData = encode(new Uint8Array(int16.buffer));
+              sessionPromise.then(s => s.sendRealtimeInput({ 
+                audio: { data: encodedData, mimeType: 'audio/pcm;rate=16000' } 
+              }));
+            };
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(inputCtx.destination);
+          },
+          onmessage: async (m: any) => {
+            const serverContent = m.serverContent;
+            if (!serverContent) return;
+
+            // 1. Model Transcript Discovery (check all possible paths)
+            let modelDelta = "";
+            if (serverContent.modelTurn?.parts) {
+              serverContent.modelTurn.parts.forEach((p: any) => { if (p.text) modelDelta += p.text; });
+            }
+            if (serverContent.outputTranscription?.text) {
+              modelDelta += serverContent.outputTranscription.text;
+            }
+
+            if (modelDelta) {
+              currentOutputTextRef.current += modelDelta;
+              setCurrentOutputText(currentOutputTextRef.current);
+              setResponses(prev => {
+                const index = prev.findIndex(msg => msg.id === 'streaming-model');
+                if (index !== -1) {
+                  const updated = [...prev];
+                  updated[index] = { ...updated[index], text: currentOutputTextRef.current };
+                  responsesRef.current = updated;
+                  return updated;
+                }
+                const updated = [...prev, { id: 'streaming-model', role: 'model', text: currentOutputTextRef.current, timestamp: new Date() }];
+                responsesRef.current = updated;
+                return updated;
+              });
+            }
+
+            // 2. User Transcript Discovery
+            const userText = serverContent.inputTranscription?.text || "";
+            if (userText) {
+              currentInputTextRef.current = userText;
+              setCurrentInputText(userText);
+              setResponses(prev => {
+                const index = prev.findIndex(msg => msg.id === 'streaming-user');
+                if (index !== -1) {
+                  const updated = [...prev];
+                  updated[index] = { ...updated[index], text: userText };
+                  responsesRef.current = updated;
+                  return updated;
+                }
+                const updated = [...prev, { id: 'streaming-user', role: 'user', text: userText, timestamp: new Date() }];
+                responsesRef.current = updated;
+                return updated;
+              });
+            }
+
+            // 3. Audio handling
+            const audioPart = serverContent.modelTurn?.parts?.find((p: any) => p.inlineData);
+            const audioData = audioPart?.inlineData?.data;
+            if (audioData) {
+              if (currentInputTextRef.current) {
+                finalizeTurn(currentInputTextRef.current, [], 'user');
+              }
+              if (audioContextRef.current) {
+                const bytes = decode(audioData);
+                currentTurnAudioChunksRef.current.push(bytes);
+                setCurrentTurnAudioChunks([...currentTurnAudioChunksRef.current]);
+                const buffer = await decodeAudioData(bytes, audioContextRef.current, 24000, 1);
+                const source = audioContextRef.current.createBufferSource();
+                source.buffer = buffer;
+                source.connect(outputNode);
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, audioContextRef.current.currentTime);
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += buffer.duration;
+                sourcesRef.current.add(source);
+                source.onended = () => sourcesRef.current.delete(source);
+              }
+            }
+
+            if (serverContent.turnComplete) {
+              finalizeTurn(currentOutputTextRef.current, currentTurnAudioChunksRef.current, 'model');
+            }
+            if (serverContent.interrupted) {
+              sourcesRef.current.forEach(s => s.stop());
+              sourcesRef.current.clear();
+              nextStartTimeRef.current = 0;
+            }
+          },
+          onerror: (err: any) => {
+            console.error("Live Session Error:", err);
+            const msg = (err?.message || String(err)).toLowerCase();
+            if (msg.includes("unavailable")) {
+              setErrorMsg("The Neural Engine is currently unavailable in your region or at capacity. Please try again in a few moments or click 'Rotate Key' to use a different project.");
+            } else if (msg.includes("403") || msg.includes("permission") || msg.includes("permission_denied")) {
+              setErrorMsg("PERMISSION_DENIED: The specified API key does not have permission for the Live API. Ensure billing is enabled on your Cloud Project and click 'Rotate Key' to try another project.");
+            } else if (msg.includes("api key") || msg.includes("401")) {
+              setErrorMsg("API Key issue detected. Please click 'Rotate Key' to refresh your connection.");
+            } else {
+              setErrorMsg("Neural link lost. Checking connection parameters... (" + msg + ")");
+            }
+            setConnStatus('error');
+            setActive(false);
+          },
+          onclose: () => {
+            setActive(false);
+            setConnStatus('idle');
+          },
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
+          outputAudioTranscription: {},
+          inputAudioTranscription: {},
+          systemInstruction: "You are a professional Neural Creative Director. Priority: SPEED, ACCURACY, and NATURAL DIALOGUE.\n\nCRITICAL PROTOCOLS:\n1. Speak like a human. Use natural, concise language. No corporate jargon.\n2. AS THE USER SPEAKS, generate your thoughts instantly. \n3. If asked for a 'PROMPT' or 'SCRIPT', deliver it IMMEDIATELY as the very first thing. Skip acknowledgments like 'Okay' or 'Wait' if a deliverable is requested.\n4. Ensure the transcript output is perfectly synced with your speech.\n5. Respond in the same natural style the user uses (e.g., Urdu, English, or mix)."
+        }
+      });
+      sessionRef.current = await sessionPromise;
+    } catch (err: any) {
+      console.error("Session Initialization Error:", err);
+      setErrorMsg("Failed to initiate neural connection. Verify your API key is active.");
+      setActive(false);
+    }
   };
 
   return (
@@ -274,62 +433,110 @@ const LiveView: React.FC = () => {
         </div>
 
         <div className="mt-16 text-center space-y-4 px-4">
+          <div className="flex items-center justify-center gap-2 mb-2">
+            <span className={`w-2 h-2 rounded-full ${connStatus === 'connected' ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]' : connStatus === 'connecting' ? 'bg-amber-500 animate-bounce' : 'bg-red-500'}`}></span>
+            <span className="text-[10px] font-bold uppercase tracking-widest text-gray-500">
+              {connStatus === 'idle' ? 'Ready' : connStatus === 'connecting' ? 'Calibrating...' : connStatus === 'connected' ? 'Neural Link Online' : 'Link Offline'}
+            </span>
+          </div>
           <h3 className="text-4xl font-bold font-outfit text-white">{active ? 'Neural Link Active' : 'Voice Interface'}</h3>
-          <p className="text-gray-400 max-w-sm mx-auto leading-relaxed">Engage in seamless conversation. Captured responses appear in your session log with full playback controls.</p>
+          <p className="text-gray-400 max-w-sm mx-auto leading-relaxed">Engage in seamless conversation. Transcription now streams in real-time with ultra-low latency.</p>
+          
+          {errorMsg && (
+            <div className="mt-6 p-6 bg-red-500/10 border border-red-500/20 rounded-[2rem] animate-in fade-in zoom-in duration-300 space-y-4">
+              <p className="text-red-400 text-sm font-medium leading-relaxed">{errorMsg}</p>
+              <button 
+                onClick={handleSwitchKey}
+                className="w-full py-3 bg-red-500/20 border border-red-500/30 rounded-xl text-xs font-bold text-red-300 hover:bg-red-500/40 transition-all flex items-center justify-center gap-2"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+                Rotate Project Key
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="mt-12 flex flex-col sm:flex-row gap-4 w-full px-8">
             <button
                 onClick={active ? stopConversation : startConversation}
-                className={`flex-1 py-5 rounded-2xl font-bold transition-all shadow-xl flex items-center justify-center gap-3 text-lg ${active ? 'bg-red-500/20 border border-red-500/50 text-red-400 hover:bg-red-500/30' : 'accent-gradient text-white hover:scale-[1.02] active:scale-[0.98]'}`}
+                disabled={connStatus === 'connecting'}
+                className={`flex-1 py-5 rounded-2xl font-bold transition-all shadow-xl flex items-center justify-center gap-3 text-lg ${active ? 'bg-red-500/20 border border-red-500/50 text-red-400 hover:bg-red-500/30' : 'accent-gradient text-white hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50'}`}
             >
-                {active ? 'Terminate Session' : 'Initiate Session'}
+                {active ? 'Terminate Session' : connStatus === 'connecting' ? 'Calibrating...' : 'Initiate Session'}
             </button>
+            {errorMsg && !active && (
+               <button 
+                onClick={startConversation}
+                className="px-8 py-5 bg-white/5 border border-white/10 rounded-2xl font-bold hover:bg-white/10 transition-all text-indigo-300 flex items-center justify-center gap-2"
+               >
+                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                 Retry Link
+               </button>
+            )}
             {active && (
                <button 
-                onClick={() => finalizeTurn(currentOutputTranscription, currentTurnAudioChunks)}
+                onClick={() => finalizeTurn(currentOutputText, currentTurnAudioChunks)}
                 className="px-8 py-5 bg-white/5 border border-white/10 rounded-2xl font-bold hover:bg-white/10 transition-all text-indigo-300 flex items-center justify-center gap-2"
                >
                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" /></svg>
-                 Capture
+                 Capture Turn
                </button>
             )}
         </div>
       </div>
 
-      <div className="flex flex-col space-y-6">
+      <div className="flex flex-col space-y-6 h-full overflow-hidden">
         <div className="flex items-center justify-between px-2">
-          <h4 className="text-xs font-bold text-gray-500 uppercase tracking-[0.2em]">Session logs</h4>
+          <h4 className="text-xs font-bold text-gray-500 uppercase tracking-[0.2em]">Neural Transcript</h4>
           {responses.length > 0 && (
             <button onClick={exportTranscript} className="text-[10px] text-indigo-400 font-bold uppercase hover:text-indigo-300 transition-colors flex items-center gap-1">
               <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-              Export Transcript
+              Export session
             </button>
           )}
         </div>
 
-        <div className="flex-1 glass-panel rounded-[2rem] border-white/5 overflow-y-auto p-8 space-y-6 custom-scrollbar bg-black/20 shadow-inner">
+        <div 
+          ref={scrollRef}
+          className="flex-1 glass-panel rounded-[2.5rem] border-white/5 overflow-y-auto p-8 space-y-6 custom-scrollbar bg-black/20 shadow-inner"
+        >
           {responses.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center opacity-10 text-center p-12 space-y-6">
                <svg className="w-24 h-24" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
-               <p className="text-2xl font-bold font-outfit">Logs empty</p>
+               <p className="text-2xl font-bold font-outfit text-white">Neural sync enabled...</p>
             </div>
           )}
           
           {responses.map((resp) => (
-            <div key={resp.id} className="p-6 bg-white/[0.03] border border-white/5 rounded-3xl space-y-6 animate-in slide-in-from-right-8 duration-500 group">
-              <div className="flex items-start justify-between gap-6">
-                <div className="space-y-1 flex-1">
-                  <div className="flex items-center gap-2 mb-2">
-                     <span className="w-2 h-2 rounded-full bg-indigo-500"></span>
-                     <span className="text-[10px] text-indigo-400 font-bold uppercase tracking-widest">Neural transcription</span>
-                  </div>
-                  <p className="text-gray-200 leading-relaxed font-medium">{resp.transcript}</p>
+            <div 
+              key={resp.id} 
+              className={`flex flex-col space-y-2 animate-in slide-in-from-bottom-4 duration-500 ${resp.role === 'user' ? 'items-end' : 'items-start'}`}
+            >
+              <div className={`max-w-[90%] p-6 rounded-3xl shadow-xl transition-all hover:scale-[1.01] ${
+                resp.role === 'user' 
+                  ? 'bg-white/5 border border-white/10 rounded-tr-none' 
+                  : 'bg-indigo-500/10 border border-indigo-500/20 rounded-tl-none'
+              } ${resp.id.startsWith('streaming') ? 'opacity-70 border-dashed border-indigo-400/30' : ''}`}>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className={`w-2 h-2 rounded-full ${resp.role === 'user' ? 'bg-gray-500' : 'bg-indigo-500'} ${resp.id.startsWith('streaming') ? 'animate-pulse' : ''}`}></span>
+                  <span className={`text-[10px] font-bold uppercase tracking-widest ${resp.role === 'user' ? 'text-gray-500' : 'text-indigo-400'}`}>
+                    {resp.role === 'user' ? (resp.id.startsWith('streaming') ? 'Listening...' : 'Your input') : (resp.id.startsWith('streaming') ? 'Neural Processing...' : 'Neural output')}
+                  </span>
+                  {!resp.id.startsWith('streaming') && (
+                    <span className="text-[8px] text-gray-600 font-mono bg-black/40 px-1.5 py-0.5 rounded-md ml-auto">
+                      {resp.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  )}
                 </div>
-                <span className="text-[10px] text-gray-600 shrink-0 font-mono bg-black/40 px-2 py-1 rounded-lg">{resp.timestamp.toLocaleTimeString()}</span>
+                <p className={`leading-relaxed font-medium ${resp.role === 'user' ? 'text-gray-300' : 'text-gray-100'}`}>
+                  {resp.text}{resp.id.startsWith('streaming') ? '...' : ''}
+                </p>
+                {resp.audioUrl && (
+                  <div className="mt-4 pt-4 border-t border-white/5">
+                    <AudioPlayer url={resp.audioUrl} id={resp.id} />
+                  </div>
+                )}
               </div>
-              
-              {resp.audioUrl && <AudioPlayer url={resp.audioUrl} id={resp.id} />}
             </div>
           ))}
         </div>

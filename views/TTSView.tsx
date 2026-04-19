@@ -1,7 +1,7 @@
 
 import React, { useState, useRef } from 'react';
 import { ELEVEN_LABS_VOICES, VoiceProfile, VoiceSettings, DEFAULT_SETTINGS } from '../types';
-import { generateTTS, classifyVoice, enhanceTextForSpeech, summarizeForVisuals, generateImage } from '../services/geminiService';
+import { generateTTS, classifyVoice, enhanceTextForSpeech, summarizeForVisuals, generateImage, PermissionError } from '../services/geminiService';
 
 const TTSView: React.FC = () => {
   const [text, setText] = useState('');
@@ -16,8 +16,12 @@ const TTSView: React.FC = () => {
   const [shouldEnhance, setShouldEnhance] = useState(true);
   const [shouldGenerateVisual, setShouldGenerateVisual] = useState(true);
   const [clonedVoices, setClonedVoices] = useState<VoiceProfile[]>(ELEVEN_LABS_VOICES);
+  const [isCloningExpanded, setIsCloningExpanded] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [isPermissionError, setIsPermissionError] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(true);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -47,6 +51,16 @@ const TTSView: React.FC = () => {
       view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
     }
     return buffer;
+  };
+
+  const handleSwitchKey = async () => {
+    // @ts-ignore
+    if (window.aistudio && typeof window.aistudio.openSelectKey === 'function') {
+      // @ts-ignore
+      await window.aistudio.openSelectKey();
+      setErrorMsg(null);
+      setIsPermissionError(false);
+    }
   };
 
   const processAudioData = (base64Audio: string) => {
@@ -80,6 +94,7 @@ const TTSView: React.FC = () => {
     }
     setLoading(true);
     setErrorMsg(null);
+    setIsPermissionError(false);
     setAudioUrl(null);
     setVisualUrl(null);
     
@@ -114,6 +129,9 @@ const TTSView: React.FC = () => {
       }
 
     } catch (err: any) {
+      if (err instanceof PermissionError) {
+        setIsPermissionError(true);
+      }
       setErrorMsg(err.message || "Synthesis failed. Please try a simpler script.");
     } finally {
       setLoading(false);
@@ -135,14 +153,22 @@ const TTSView: React.FC = () => {
         
         const newVoice: VoiceProfile = {
           id: `clone-${Date.now()}`,
-          name: `Clone: ${file.name.split('.')[0]}`,
+          name: file.name.split('.')[0],
           geminiVoice: analysis.id,
           description: analysis.summary,
           gender: analysis.gender as any,
           traits: analysis.traits,
-          settings: { ...DEFAULT_SETTINGS }
+          settings: { 
+            ...DEFAULT_SETTINGS,
+            pitch: analysis.pitch === 'low' ? 0.8 : analysis.pitch === 'high' ? 1.2 : 1.0,
+            rate: analysis.rate === 'slow' ? 0.8 : analysis.rate === 'fast' ? 1.2 : 1.0,
+            style: (['neutral', 'expressive', 'calm', 'authoritative', 'whisper', 'dramatic', 'storyteller'] as const).includes(analysis.style as any) 
+              ? (analysis.style as any) 
+              : 'neutral'
+          }
         };
         setPendingClone(newVoice);
+        setIsCloningExpanded(true);
         setCloning(false);
         if (fileInputRef.current) fileInputRef.current.value = '';
       };
@@ -153,54 +179,40 @@ const TTSView: React.FC = () => {
     }
   };
 
+  const updatePendingCloneSetting = <K extends keyof VoiceSettings>(key: K, value: VoiceSettings[K]) => {
+    if (!pendingClone) return;
+    setPendingClone({
+      ...pendingClone,
+      settings: { ...pendingClone.settings, [key]: value }
+    });
+  };
+
+  const handlePreviewClone = async () => {
+    if (!pendingClone) return;
+    setPreviewLoading(true);
+    setPreviewUrl(null);
+    try {
+      const sampleText = "This is a neural preview of my synthesized vocal mapping. Checking resonance and cadence.";
+      const base64Audio = await generateTTS(sampleText, pendingClone.geminiVoice, pendingClone.settings, "Speak naturally and clearly to test settings.");
+      if (base64Audio) {
+        const url = processAudioData(base64Audio);
+        if (url) {
+          setPreviewUrl(url);
+          const audio = new Audio(url);
+          audio.play();
+        }
+      }
+    } catch (e: any) {
+      setErrorMsg("Preview failed: " + (e.message || "Neural engine busy"));
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-20">
       
-      {/* Clone Confirmation Modal */}
-      {pendingClone && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-950/95 backdrop-blur-2xl p-4">
-          <div className="max-w-2xl w-full glass-panel rounded-[3rem] p-12 space-y-8 border-indigo-500/30 animate-in zoom-in-95">
-            <div className="text-center space-y-3">
-              <div className="w-20 h-20 rounded-3xl accent-gradient mx-auto flex items-center justify-center text-4xl shadow-2xl">🧬</div>
-              <h2 className="text-3xl font-bold font-outfit text-white">Neural Mapping Complete</h2>
-              <p className="text-gray-400">Identity established for <span className="text-indigo-400 font-bold">{pendingClone.geminiVoice}</span> substrate.</p>
-            </div>
-
-            <div className="bg-white/5 p-8 rounded-[2rem] border border-white/5 space-y-4">
-                <div className="flex justify-between items-center">
-                    <span className="text-xs font-bold text-gray-500 uppercase tracking-widest">Biological Gender</span>
-                    <span className={`text-[10px] px-3 py-1 rounded-full font-bold uppercase ${pendingClone.gender === 'female' ? 'bg-pink-500/20 text-pink-400' : 'bg-blue-500/20 text-blue-400'}`}>
-                      {pendingClone.gender}
-                    </span>
-                </div>
-                <div className="space-y-2">
-                    <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Custom Alias</label>
-                    <input 
-                      type="text" 
-                      value={pendingClone.name} 
-                      onChange={(e) => setPendingClone({...pendingClone, name: e.target.value})}
-                      className="w-full bg-black/40 border border-white/10 rounded-xl p-4 text-white font-bold outline-none focus:border-indigo-500/50"
-                    />
-                </div>
-                <div className="flex flex-wrap gap-2 pt-2">
-                  {pendingClone.traits?.map(trait => (
-                    <span key={trait} className="px-3 py-1 bg-indigo-500/10 border border-indigo-500/20 rounded-lg text-[10px] text-indigo-300 font-bold uppercase">{trait}</span>
-                  ))}
-                </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <button 
-                onClick={() => { setClonedVoices([pendingClone, ...clonedVoices]); setSelectedVoice(pendingClone); setPendingClone(null); }}
-                className="py-5 accent-gradient rounded-3xl font-bold text-sm hover:scale-[1.02] active:scale-[0.98] transition-all shadow-xl"
-              >
-                Finalize Identity
-              </button>
-              <button onClick={() => setPendingClone(null)} className="py-5 bg-white/5 border border-white/10 rounded-3xl text-xs text-gray-500 font-bold uppercase tracking-widest hover:text-white transition-colors">Discard</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Modal removed to use the sidebar section instead */}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-10">
         
@@ -230,35 +242,43 @@ const TTSView: React.FC = () => {
                   <div className="space-y-4">
                     <div className="flex justify-between text-xs font-bold uppercase text-gray-500 tracking-widest">
                       <span>Neural Pitch</span>
-                      <span className="text-purple-400">{selectedVoice.settings.pitch}x</span>
+                      <span className="text-purple-400">{selectedVoice.settings.pitch < 0.9 ? 'Low' : selectedVoice.settings.pitch > 1.1 ? 'High' : 'Normal'} ({selectedVoice.settings.pitch}x)</span>
                     </div>
                     <input 
                       type="range" min="0.5" max="1.5" step="0.05" 
-                      value={selectedVoice.settings.pitch}
+                      value={selectedVoice.settings.pitch ?? 1.0}
                       onChange={(e) => updateSelectedVoiceSetting('pitch', parseFloat(e.target.value))}
-                      className="w-full accent-purple-500 h-1.5 bg-white/5 rounded-full"
+                      className="w-full accent-purple-500 h-1.5 bg-white/5 rounded-full cursor-pointer hover:accent-purple-400 transition-all"
                     />
+                    <div className="flex justify-between text-[8px] font-bold text-gray-700 uppercase tracking-widest px-1">
+                      <span>Depths</span>
+                      <span>Altos</span>
+                    </div>
                   </div>
                   <div className="space-y-4">
                     <div className="flex justify-between text-xs font-bold uppercase text-gray-500 tracking-widest">
                       <span>Cadence</span>
-                      <span className="text-purple-400">{selectedVoice.settings.rate}x</span>
+                      <span className="text-purple-400">{selectedVoice.settings.rate < 0.8 ? 'Steady' : selectedVoice.settings.rate > 1.2 ? 'Rapid' : 'Normal'} ({selectedVoice.settings.rate}x)</span>
                     </div>
                     <input 
                       type="range" min="0.5" max="2.0" step="0.05" 
-                      value={selectedVoice.settings.rate}
+                      value={selectedVoice.settings.rate ?? 1.0}
                       onChange={(e) => updateSelectedVoiceSetting('rate', parseFloat(e.target.value))}
-                      className="w-full accent-purple-500 h-1.5 bg-white/5 rounded-full"
+                      className="w-full accent-purple-500 h-1.5 bg-white/5 rounded-full cursor-pointer hover:accent-purple-400 transition-all"
                     />
+                    <div className="flex justify-between text-[8px] font-bold text-gray-700 uppercase tracking-widest px-1">
+                      <span>Slow</span>
+                      <span>Fast</span>
+                    </div>
                   </div>
                   <div className="space-y-4">
                     <div className="flex justify-between text-xs font-bold uppercase text-gray-500 tracking-widest">
                       <span>Master Volume</span>
-                      <span className="text-purple-400">{Math.round(selectedVoice.settings.volume * 100)}%</span>
+                      <span className="text-purple-400">{Math.round((selectedVoice.settings.volume ?? 1) * 100)}%</span>
                     </div>
                     <input 
                       type="range" min="0" max="1" step="0.05" 
-                      value={selectedVoice.settings.volume}
+                      value={selectedVoice.settings.volume ?? 1.0}
                       onChange={(e) => updateSelectedVoiceSetting('volume', parseFloat(e.target.value))}
                       className="w-full accent-purple-500 h-1.5 bg-white/5 rounded-full"
                     />
@@ -267,13 +287,13 @@ const TTSView: React.FC = () => {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-10 pt-8 border-t border-white/5">
                   <div className="space-y-4">
-                    <label className="text-[10px] font-bold text-gray-600 uppercase tracking-[0.2em]">Prosody style</label>
+                    <label className="text-[10px] font-bold text-gray-600 uppercase tracking-[0.2em]">Vocal Style & Emotion</label>
                     <div className="flex flex-wrap gap-2">
                       {(['neutral', 'expressive', 'calm', 'authoritative', 'whisper', 'dramatic', 'storyteller'] as const).map(style => (
                         <button
                           key={style}
                           onClick={() => updateSelectedVoiceSetting('style', style)}
-                          className={`px-4 py-2 rounded-xl text-[10px] font-bold uppercase border transition-all ${selectedVoice.settings.style === style ? 'bg-purple-500 border-purple-500 text-white shadow-lg' : 'bg-white/5 border-white/10 text-gray-600 hover:text-gray-400'}`}
+                          className={`px-5 py-3 rounded-2xl text-[10px] font-bold uppercase border transition-all ${selectedVoice.settings.style === style ? 'bg-purple-600 border-purple-500 text-white shadow-[0_0_20px_rgba(168,85,247,0.4)]' : 'bg-white/5 border-white/10 text-gray-500 hover:text-gray-300 hover:bg-white/10'}`}
                         >
                           {style}
                         </button>
@@ -282,16 +302,25 @@ const TTSView: React.FC = () => {
                   </div>
                   <div className="space-y-4">
                     <label className="text-[10px] font-bold text-gray-600 uppercase tracking-[0.2em]">Vocal Accent</label>
-                    <div className="flex flex-wrap gap-2">
-                      {(['natural', 'american', 'british', 'australian', 'soft', 'strong'] as const).map(accent => (
-                        <button
-                          key={accent}
-                          onClick={() => updateSelectedVoiceSetting('accent', accent)}
-                          className={`px-4 py-2 rounded-xl text-[10px] font-bold uppercase border transition-all ${selectedVoice.settings.accent === accent ? 'bg-purple-500 border-purple-500 text-white shadow-lg' : 'bg-white/5 border-white/10 text-gray-600 hover:text-gray-400'}`}
-                        >
-                          {accent}
-                        </button>
-                      ))}
+                    <div className="relative">
+                      <select 
+                        value={selectedVoice.settings.accent || 'natural'}
+                        onChange={(e) => updateSelectedVoiceSetting('accent', e.target.value as any)}
+                        className="w-full bg-white/5 border border-white/10 rounded-2xl px-5 py-4 text-xs font-bold text-gray-300 outline-none appearance-none focus:border-purple-500/50 transition-all cursor-pointer pr-10 hover:bg-white/10"
+                      >
+                        <option value="natural" className="bg-gray-900">Natural (Default)</option>
+                        <option value="american" className="bg-gray-900">American Accent</option>
+                        <option value="british" className="bg-gray-900">British Accent</option>
+                        <option value="australian" className="bg-gray-900">Australian Accent</option>
+                        <option value="indian" className="bg-gray-900">Indian Accent</option>
+                        <option value="french" className="bg-gray-900">French Accent</option>
+                        <option value="spanish" className="bg-gray-900">Spanish Accent</option>
+                        <option value="soft" className="bg-gray-900">Soft / Mellow</option>
+                        <option value="strong" className="bg-gray-900">Strong / Deep</option>
+                      </select>
+                      <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-gray-500">
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -300,7 +329,7 @@ const TTSView: React.FC = () => {
 
             <div className="relative group">
               <textarea
-                value={text}
+                value={text || ''}
                 onChange={(e) => { setText(e.target.value); if (errorMsg) setErrorMsg(null); }}
                 placeholder="The narrative flows from here. Enter your script for high-fidelity synthesis..."
                 className="w-full h-80 p-12 glass-panel rounded-[3rem] border-white/10 focus:border-indigo-500/50 outline-none resize-none transition-all text-xl leading-relaxed shadow-2xl font-light placeholder:text-gray-700"
@@ -311,7 +340,7 @@ const TTSView: React.FC = () => {
               <label className="text-[10px] font-bold text-gray-500 uppercase tracking-[0.3em] pl-6">Neural Direction (Prompt-Based)</label>
               <input 
                 type="text"
-                value={vocalPrompt}
+                value={vocalPrompt || ''}
                 onChange={(e) => setVocalPrompt(e.target.value)}
                 placeholder="Describe the mood: 'Speak with a slow, mysterious whisper' or 'High-energy excited announcer'..."
                 className="w-full p-6 glass-panel rounded-2xl border-white/10 focus:border-indigo-500/50 outline-none shadow-2xl text-sm font-medium"
@@ -320,9 +349,20 @@ const TTSView: React.FC = () => {
           </div>
 
           {errorMsg && (
-            <div className="p-6 bg-rose-500/10 border border-rose-500/30 rounded-3xl flex items-center gap-4 text-rose-400 text-sm animate-in zoom-in-95">
-              <div className="w-8 h-8 rounded-full bg-rose-500/20 flex items-center justify-center shrink-0 text-lg">⚠️</div>
-              <p className="font-bold">{errorMsg}</p>
+            <div className="p-6 bg-rose-500/10 border border-rose-500/30 rounded-3xl flex flex-col gap-4 text-rose-400 text-sm animate-in zoom-in-95">
+              <div className="flex items-center gap-4">
+                <div className="w-8 h-8 rounded-full bg-rose-500/20 flex items-center justify-center shrink-0 text-lg">⚠️</div>
+                <p className="font-bold">{errorMsg}</p>
+              </div>
+              {isPermissionError && (
+                <button 
+                  onClick={handleSwitchKey}
+                  className="w-full py-3 bg-rose-500/20 border border-rose-500/30 rounded-xl text-xs font-bold text-rose-300 hover:bg-rose-500/40 transition-all flex items-center justify-center gap-2"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+                  Rotate Project Key
+                </button>
+              )}
             </div>
           )}
 
@@ -383,18 +423,173 @@ const TTSView: React.FC = () => {
 
         <div className="lg:col-span-4 space-y-8">
           <div className="glass-panel rounded-[2.5rem] p-10 border-white/5 space-y-10 shadow-2xl sticky top-24">
-            <div className="flex items-center justify-between">
-              <label className="text-sm font-bold text-gray-500 uppercase tracking-widest">Voice Identities</label>
-              <button 
-                onClick={() => fileInputRef.current?.click()} 
-                disabled={cloning}
-                className="text-[10px] px-6 py-3 rounded-full font-bold bg-indigo-500 text-white hover:bg-indigo-600 transition-all shadow-xl hover:scale-105 active:scale-95 flex items-center gap-2"
-              >
-                {cloning ? 'DNA SCANNING...' : (
-                  <><svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" /></svg> CLONE VOICE</>
-                )}
-              </button>
-              <input type="file" ref={fileInputRef} onChange={handleCloneVoice} accept="audio/*" className="hidden" />
+            
+            {/* Cloning Settings Section */}
+            <div className="space-y-6">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-bold text-gray-500 uppercase tracking-widest">Neural DNA Laboratory</label>
+                <button 
+                  onClick={() => setIsCloningExpanded(!isCloningExpanded)}
+                  className={`p-2 rounded-full transition-all ${isCloningExpanded ? 'bg-indigo-500/20 text-indigo-400 rotate-180' : 'text-gray-600 hover:text-white'}`}
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
+                </button>
+              </div>
+
+              {isCloningExpanded && (
+                <div className="space-y-6 pt-2 animate-in slide-in-from-top-4">
+                  {!pendingClone ? (
+                    <div 
+                      onClick={() => !cloning && fileInputRef.current?.click()}
+                      className={`group cursor-pointer border-2 border-dashed border-white/10 rounded-3xl p-8 text-center space-y-4 transition-all ${cloning ? 'opacity-50 cursor-wait' : 'hover:border-indigo-500/50 hover:bg-indigo-500/5'}`}
+                    >
+                      <div className={`w-16 h-16 rounded-2xl bg-white/5 mx-auto flex items-center justify-center text-3xl transition-transform ${cloning ? 'animate-pulse' : 'group-hover:scale-110'}`}>
+                        {cloning ? '💫' : '🧬'}
+                      </div>
+                      <div className="space-y-1">
+                        <p className="text-sm font-bold text-gray-200">{cloning ? 'Mapping Neural Pathways...' : 'Start Vocal Mapping'}</p>
+                        <p className="text-[10px] text-gray-500 uppercase">{cloning ? 'Capturing Vocal DNA Signature' : 'Upload source audio (.wav, .mp3)'}</p>
+                      </div>
+                      <input type="file" ref={fileInputRef} onChange={handleCloneVoice} accept="audio/*" className="hidden" />
+                    </div>
+                  ) : (
+                    <div className="space-y-6 bg-indigo-500/5 p-6 rounded-3xl border border-indigo-500/20 shadow-inner">
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-2">Clone Alias</label>
+                        <input 
+                          type="text" 
+                          value={pendingClone.name || ''} 
+                          onChange={(e) => setPendingClone({...pendingClone, name: e.target.value})}
+                          placeholder="Character or Voice Name"
+                          className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-3 text-sm text-white font-bold outline-none focus:border-indigo-500/50"
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-2">Source Gender</label>
+                        <div className="grid grid-cols-3 gap-2">
+                          {(['male', 'female', 'neutral'] as const).map(g => (
+                            <button
+                              key={g}
+                              onClick={() => setPendingClone({...pendingClone, gender: g})}
+                              className={`py-2 rounded-xl text-[10px] font-bold uppercase border transition-all ${pendingClone.gender === g ? 'bg-indigo-500 border-indigo-500 text-white shadow-lg' : 'bg-white/5 border-white/10 text-gray-600 hover:text-gray-400'}`}
+                            >
+                              {g}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-4 pt-4 border-t border-white/5">
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-xs font-bold uppercase text-gray-500 tracking-widest px-2">
+                            <span>Detected Pitch</span>
+                            <span className="text-indigo-400">{pendingClone.settings.pitch}x</span>
+                          </div>
+                          <input 
+                            type="range" min="0.5" max="1.5" step="0.05" 
+                            value={pendingClone.settings.pitch ?? 1.0}
+                            onChange={(e) => updatePendingCloneSetting('pitch', parseFloat(e.target.value))}
+                            className="w-full accent-indigo-500 h-1 bg-white/10 rounded-full"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-xs font-bold uppercase text-gray-500 tracking-widest px-2">
+                            <span>Detected Rate</span>
+                            <span className="text-indigo-400">{pendingClone.settings.rate}x</span>
+                          </div>
+                          <input 
+                            type="range" min="0.5" max="2.0" step="0.05" 
+                            value={pendingClone.settings.rate ?? 1.0}
+                            onChange={(e) => updatePendingCloneSetting('rate', parseFloat(e.target.value))}
+                            className="w-full accent-indigo-500 h-1 bg-white/10 rounded-full"
+                          />
+                        </div>
+
+                        <div className="space-y-2">
+                          <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-2">Detected Style</label>
+                          <div className="grid grid-cols-2 gap-2">
+                            {(['neutral', 'expressive', 'calm', 'authoritative', 'whisper', 'dramatic', 'storyteller'] as const).map(style => (
+                              <button
+                                key={style}
+                                onClick={() => updatePendingCloneSetting('style', style)}
+                                className={`py-1.5 rounded-lg text-[8px] font-bold uppercase border transition-all ${pendingClone.settings.style === style ? 'bg-indigo-500 border-indigo-500 text-white shadow-lg' : 'bg-white/5 border-white/10 text-gray-600 hover:text-gray-400'}`}
+                              >
+                                {style}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="space-y-2">
+                          <label className="text-[10px] font-bold text-gray-500 uppercase tracking-widest ml-2">Assigned Accent</label>
+                          <div className="relative">
+                            <select 
+                              value={pendingClone.settings.accent || 'natural'}
+                              onChange={(e) => updatePendingCloneSetting('accent', e.target.value as any)}
+                              className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-2 text-[10px] font-bold text-gray-400 outline-none appearance-none focus:border-indigo-500/50 cursor-pointer pr-10"
+                            >
+                              <option value="natural" className="bg-gray-900">Natural</option>
+                              <option value="american" className="bg-gray-900">American</option>
+                              <option value="british" className="bg-gray-900">British</option>
+                              <option value="australian" className="bg-gray-900">Australian</option>
+                            </select>
+                            <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-gray-600">
+                              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-3 pt-4 border-t border-white/5">
+                        <button
+                          onClick={handlePreviewClone}
+                          disabled={previewLoading}
+                          className={`w-full py-3 rounded-xl font-bold text-[10px] tracking-widest border transition-all flex items-center justify-center gap-2 ${previewLoading ? 'bg-indigo-500/10 border-indigo-500/30 text-indigo-400 opacity-50' : 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300 hover:bg-indigo-500/30 hover:border-indigo-500 text-white shadow-lg shadow-indigo-500/10'}`}
+                        >
+                          {previewLoading ? (
+                            <div className="w-3 h-3 border-2 border-indigo-400/30 border-t-indigo-400 rounded-full animate-spin" />
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <svg className="w-4 h-4 text-indigo-400" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+                              <span>PREVIEW CLONE</span>
+                            </div>
+                          )}
+                        </button>
+
+                        <div className="flex gap-2">
+                          <button 
+                            onClick={() => { 
+                              setClonedVoices([pendingClone, ...clonedVoices]); 
+                              setSelectedVoice(pendingClone); 
+                              setPendingClone(null); 
+                              setPreviewUrl(null); 
+                            }}
+                            className="flex-1 py-3 accent-gradient rounded-xl font-bold text-xs hover:scale-[1.02] active:scale-[0.98] transition-all shadow-lg"
+                          >
+                            SAVE IDENTITY
+                          </button>
+                          <button 
+                            onClick={() => { setPendingClone(null); setPreviewUrl(null); }}
+                            className="px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-[10px] text-gray-500 font-bold uppercase hover:text-white transition-colors"
+                            title="Discard"
+                          >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-white/5 pt-10 space-y-6">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-bold text-gray-500 uppercase tracking-widest">Voice Identities</label>
+                <span className="text-[10px] font-bold text-indigo-400 bg-indigo-500/10 px-2 py-1 rounded">{clonedVoices.length} Total</span>
+              </div>
             </div>
 
             <div className="space-y-5 max-h-[640px] overflow-y-auto pr-3 custom-scrollbar">

@@ -1,6 +1,6 @@
 
 import React, { useState } from 'react';
-import { analyzeMedia, analyzeUrl } from '../services/geminiService';
+import { analyzeMedia, analyzeUrl, PermissionError } from '../services/geminiService';
 import { AnalysisResult } from '../types';
 
 interface SequencedSegment {
@@ -19,6 +19,8 @@ const MediaAnalysisView: React.FC = () => {
   const [urlInput, setUrlInput] = useState('');
   const [preview, setPreview] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isPermissionError, setIsPermissionError] = useState(false);
   const [result, setResult] = useState<EnhancedAnalysisResult | null>(null);
   const [activeTab, setActiveTab] = useState<'upload' | 'url'>('upload');
 
@@ -29,6 +31,7 @@ const MediaAnalysisView: React.FC = () => {
       const url = URL.createObjectURL(f);
       setPreview(url);
       setResult(null);
+      setError(null);
       setUrlInput('');
     }
   };
@@ -56,32 +59,64 @@ const MediaAnalysisView: React.FC = () => {
     a.click();
   };
 
+  const handleSwitchKey = async () => {
+    // @ts-ignore
+    if (window.aistudio && typeof window.aistudio.openSelectKey === 'function') {
+      // @ts-ignore
+      await window.aistudio.openSelectKey();
+      setError(null);
+      setIsPermissionError(false);
+    }
+  };
+
   const processUpload = async () => {
     if (!file) return;
     setLoading(true);
+    setError(null);
+    setIsPermissionError(false);
     try {
       const reader = new FileReader();
       reader.onloadend = async () => {
-        const base64 = reader.result as string;
-        const analysis = await analyzeMedia(base64, file.type);
-        setResult(analysis);
+        try {
+          const base64 = reader.result as string;
+          const analysis = await analyzeMedia(base64, file.type);
+          setResult(analysis);
+        } catch (err: any) {
+          if (err instanceof PermissionError) {
+            setIsPermissionError(true);
+            setError(err.message);
+          } else {
+            setError(err.message || 'Media extraction failed. Ensure the clip is under 50MB.');
+          }
+          console.error(err);
+        } finally {
+          setLoading(false);
+        }
       };
       reader.readAsDataURL(file);
-    } catch (err) {
-      console.error(err);
-    } finally {
+    } catch (err: any) {
+      setError(err.message || 'Failed to read media file.');
       setLoading(false);
     }
   };
 
-  const processUrl = async () => {
+  const processUrl = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     if (!urlInput) return;
     setLoading(true);
     setResult(null);
+    setError(null);
+    setIsPermissionError(false);
     try {
       const analysis = await analyzeUrl(urlInput);
       setResult(analysis);
-    } catch (err) {
+    } catch (err: any) {
+      if (err instanceof PermissionError) {
+        setIsPermissionError(true);
+        setError(err.message);
+      } else {
+        setError(err.message || 'Could not analyze URL. Verify the source is publicly accessible.');
+      }
       console.error(err);
     } finally {
       setLoading(false);
@@ -148,26 +183,42 @@ const MediaAnalysisView: React.FC = () => {
                   </button>
                 </div>
               ) : (
-                <div className="space-y-6">
+                <form onSubmit={processUrl} className="space-y-6">
                   <div className="space-y-2">
                     <label className="text-xs font-bold text-gray-400 uppercase tracking-widest">Video URL</label>
                     <input 
                       type="url" 
-                      value={urlInput}
+                      value={urlInput || ''}
                       onChange={(e) => setUrlInput(e.target.value)}
                       placeholder="Paste link (YouTube, Social, etc.)"
                       className="w-full p-4 glass-panel rounded-xl border-white/10 focus:border-indigo-500/50 outline-none text-sm"
                     />
                   </div>
                   <p className="text-[10px] text-gray-500 font-medium">Gemini will use Google Search to find the full transcript and analyze all video content in its original language.</p>
+                  
+                  {error && (
+                    <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl space-y-3 animate-in fade-in slide-in-from-top-2">
+                      <p className="text-red-400 text-xs font-medium">{error}</p>
+                      {isPermissionError && (
+                        <button 
+                          onClick={handleSwitchKey}
+                          className="w-full py-2 bg-red-500/20 border border-red-500/30 rounded-lg text-[10px] font-bold text-red-300 hover:bg-red-500/40 transition-all flex items-center justify-center gap-2"
+                        >
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+                          Rotate Project Key
+                        </button>
+                      )}
+                    </div>
+                  )}
+
                   <button
-                    onClick={processUrl}
+                    type="submit"
                     disabled={loading || !urlInput}
                     className="w-full py-4 accent-gradient rounded-2xl font-bold transition-all hover:scale-[1.01] active:scale-[0.98] disabled:opacity-50 shadow-xl shadow-indigo-500/10"
                   >
                     {loading ? 'Retrieving Transcript...' : 'Analyze URL Content'}
                   </button>
-                </div>
+                </form>
               )}
             </div>
           </div>
